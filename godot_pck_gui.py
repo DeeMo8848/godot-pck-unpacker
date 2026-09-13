@@ -22,14 +22,17 @@ from tkinter import ttk, filedialog, messagebox
 
 from godot_pck_unpacker import unpack, parse_header, parse_directory, RES_PREFIX
 
-# 资源类型 -> 源扩展名 (用于按类型筛选; 纹理源为 .ctex/.stex, 归位后变 .png)
+# 资源类型 -> 源扩展名
+# 注意: PCK 里**打包后**的音频是 .sample(Godot4 WAV) / .oggvorbisstr(Godot4 OGG),
+# 字体是 .fontdata; 而不是 .wav/.ogg/.ttf 等源格式。分类必须列打包后的扩展名, 否则会漏。
 CATEGORIES = {
-    "图像":   ["ctex", "stex", "png", "webp", "jpg", "jpeg", "bmp", "svg", "tga"],
-    "音效":   ["wav", "ogg", "mp3", "opus", "flac", "m4a"],
-    "字体":   ["ttf", "otf", "font", "woff", "woff2", "fnt"],
+    "图像":   ["ctex", "stex", "png", "webp", "jpg", "jpeg", "bmp", "svg", "tga", "ico", "dds", "ktx", "exr", "hdr"],
+    "音效":   ["sample", "oggvorbisstr", "mp3str", "wav", "ogg", "mp3", "opus", "flac", "m4a"],
+    "字体":   ["fontdata", "ttf", "otf", "font", "woff", "woff2", "fnt"],
     "脚本":   ["gd", "gdc", "cs"],
     "场景":   ["tscn", "scn"],
     "着色器": ["gdshader", "shader"],
+    "资源":   ["res", "tres"],
 }
 
 # ---------- Windows 拖拽支持 (ctypes 子类化 WNDPROC) ----------
@@ -72,7 +75,7 @@ class App:
         self.organize_var = tk.BooleanVar(value=True)
         self.convert_var = tk.BooleanVar(value=True)
         self.keepraw_var = tk.BooleanVar(value=False)
-        self.skip_meta_var = tk.BooleanVar(value=False)  # 默认不跳过 -> 导出全部资源
+        self.skip_meta_var = tk.BooleanVar(value=True)  # 默认跳过 .import/.remap 元数据
         self._dropped = []  # 拖拽: 由 WNDPROC 填充, 主线程 _poll 消费
         self.status_var = tk.StringVar(value="请选择或拖入 .pck 文件")
         self.info_var = tk.StringVar(value="")
