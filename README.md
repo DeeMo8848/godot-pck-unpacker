@@ -6,6 +6,8 @@
 > ⚠️ **版本支持声明（重要）**
 > 本工具当前**仅对 Godot 4 做过真实解包验证**（在 Godot 4.4.1 的 269MB 资源包上成功提取全部 4566 个文件）。
 > 对 Godot 3.x 与 Godot 4.5+ 虽已编写兼容代码，但**尚未用真实样本测试**，如遇问题欢迎提 Issue。
+>
+> **实测结果**：4566 个文件 → **1722 张 PNG + 42 个 WAV + 55 个 TTF**，0 错误，字体经 Windows 正常识别。
 
 | PCK 版本 | 对应 Godot      | 状态                                              |
 |----------|----------------|--------------------------------------------------|
@@ -38,30 +40,46 @@
 | `godot-unpacker.py`      | 目录自带的原始参考工具（仅支持 Godot 3，本工具不依赖它） |
 | `dist/GodotPCKUnpacker.exe` | 打包好的图形界面单文件版（见 Releases） |
 
+> `data.pck` / `data_unpacked/` / `extracted_assets/` 等为本地测试资源与产物，**已在 `.gitignore` 排除，不入库**。
+
 ## 命令行用法
 
 ```bash
-# 基本解包（自动识别版本，纹理转 PNG 并归位）
-python godot_pck_unpacker.py game.pck
-
-# 指定输出目录
-python godot_pck_unpacker.py game.pck -o out_dir
-
-# 仅列出包内文件（支持筛选参数做预览）
-python godot_pck_unpacker.py game.pck --list
-
-# 按类型筛选：只导图像 + 音效 + UI 三类
-python godot_pck_unpacker.py game.pck --include Sprites,Sounds,UI
-
-# 转 PNG 时额外保留原始 .ctex（用于 Godot 工程重建）
-python godot_pck_unpacker.py game.pck --keep-raw
-
-# 只导音频和字体（自动还原成 .wav / .ttf）
-python godot_pck_unpacker.py game.pck --ext wav,ttf --include Sounds,Fonts
+pip install pillow zstandard          # 可选依赖（强烈建议）
+python godot_pck_unpacker.py game.pck # 一条命令全解包
 ```
 
-筛选参数：`--include 前缀`、`--exclude 前缀`、`--ext 扩展名`（逗号或空格分隔，支持源扩展名或转换后扩展名）。
-其他开关：`--no-convert`（不转纹理）、`--no-media`（不还原音频/字体）、`--no-meta`（不导 `.import`/`.remap` 元数据）。
+| 参数 | 说明 |
+|------|------|
+| `pck` | **(必填)** .pck 文件路径 |
+| `-o, --output DIR` | 输出目录（默认 `<pck名>_unpacked`） |
+| `--no-convert` | 不把纹理转成 PNG/WebP，保留原始 `.ctex/.stex` |
+| `--no-media` | 不还原音频/字体，保留原始 `.sample/.fontdata` |
+| `--no-organize` | 不按 `.import` 映射归位，资源留在 `.godot/imported/` 下 |
+| `--keep-webp` / `--keep-raw` | 转 PNG 时额外保留 `.webp` / 原始 `.ctex`（用于 Godot 工程重建） |
+| `--no-meta` | 不导出 `.import/.remap` 元数据（约 1KB 纯文本） |
+| `--include A,B` | 只导出这些路径前缀/分类（如 `Sprites,UI`） |
+| `--exclude A,B` | 排除这些路径前缀（如 `.godot`） |
+| `--ext x,y` | 只导出这些扩展名（源或转换后均可，如 `png`/`wav`/`ttf`） |
+| `--list` | 仅列出包内文件，不解包（可配合筛选预览） |
+| `-q, --quiet` | 减少输出 |
+
+```bash
+# 只要美术素材（输出干净开发原名 PNG）
+python godot_pck_unpacker.py game.pck --ext png --no-meta
+
+# 只要音频 + 字体（自动还原为可播放 .wav / 可安装 .ttf）
+python godot_pck_unpacker.py game.pck --ext wav,ttf --include Sounds,Fonts
+
+# 只提取 Sprites / UI 两个目录（先预览再提取）
+python godot_pck_unpacker.py game.pck --list --include Sprites
+python godot_pck_unpacker.py game.pck --include Sprites,UI
+
+# 除引擎缓存目录外全导出
+python godot_pck_unpacker.py game.pck --exclude .godot
+```
+
+> 完整参数说明、筛选规则与 FAQ 见 **[README_godot_pck_unpacker.md](README_godot_pck_unpacker.md)**。
 
 ## 图形界面 / EXE 用法
 

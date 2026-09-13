@@ -9,31 +9,68 @@
 | v2 | Godot 4.0–4.4 | ✅ 已实测 (Godot 4.4.1, 真实解包 4566 文件) |
 | v3 | Godot 4.5+ | 代码支持 (未实测样本) |
 
-## 用法
+> 实测样本：269MB 的 Godot 4.4.1 资源包（4566 个文件）→ 成功产出
+> **1722 张 PNG + 42 个 WAV + 55 个 TTF**，0 错误，字体经 Windows 正常识别。
+
+## 快速开始
 ```bash
-# 基本解包 (自动识别版本, 纹理转 PNG 并按原始路径归位)
+# 1. 装可选依赖 (强烈建议, 否则纹理不转 PNG / 字体不还原)
+pip install pillow zstandard
+
+# 2. 一条命令解完整包:
+#    自动识别版本 -> 纹理转 PNG -> 音频转 WAV -> 字体转 TTF -> 全部归位到开发时原名
+python godot_pck_unpacker.py game.pck
+#    产物默认输出到 ./game_unpacked/
+```
+
+## 命令行参数速查
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `pck` | **(必填)** .pck 文件路径 | — |
+| `-o, --output DIR` | 输出目录 | `<pck名>_unpacked` |
+| `--no-convert` | 不把纹理转成 PNG/WebP，保留原始 `.ctex/.stex` | 开启转换 |
+| `--no-media` | 不还原音频/字体，保留原始 `.sample/.fontdata` | 开启还原 |
+| `--no-organize` | 不按 `.import` 映射归位，资源留在 `.godot/imported/` 下 | 开启归位 |
+| `--keep-webp` | 转 PNG 时额外保留 `.webp` 原文件 | 关 |
+| `--keep-raw` | 额外保留原始 `.ctex/.stex`（用于 Godot 工程重建） | 关 |
+| `--no-meta` | 不导出 `.import/.remap` 元数据（约 1KB 纯文本，跳过更干净） | 导出全部 |
+| `--include A,B` | 只导出这些路径前缀/分类 | 全部 |
+| `--exclude A,B` | 排除这些路径前缀 | 无 |
+| `--ext x,y` | 只导出这些扩展名（源或转换后均可） | 全部 |
+| `--list` | 只列出包内文件，不解包（可用筛选参数预览） | — |
+| `-q, --quiet` | 减少输出 | — |
+| `-h, --help` | 显示帮助 | — |
+
+## 常用命令示例
+```bash
+# 1) 全解包（最常用）
 python godot_pck_unpacker.py game.pck
 
-# 指定输出目录
-python godot_pck_unpacker.py game.pck -o out_dir
+# 2) 只要美术素材，输出干净的开发原名 PNG
+python godot_pck_unpacker.py game.pck --ext png --no-meta
 
-# 只列出包内文件, 不解包 (支持下面所有筛选参数做预览)
-python godot_pck_unpacker.py game.pck --list
+# 3) 只要音频和字体（自动转成可播放/可安装格式）
+python godot_pck_unpacker.py game.pck --ext wav,ttf --include Sounds,Fonts --no-meta
 
-# 不转换纹理 (保留原始 .ctex/.stex)
-python godot_pck_unpacker.py game.pck --no-convert
+# 4) 只提取 Sprites 和 UI 两个目录
+python godot_pck_unpacker.py game.pck --include Sprites,UI
 
-# 不还原音频/字体 (保留原始 .sample/.fontdata)
-python godot_pck_unpacker.py game.pck --no-media
+# 5) 先预览命中哪些文件，再真提取（输出到指定目录）
+python godot_pck_unpacker.py game.pck --list --include Sprites
+python godot_pck_unpacker.py game.pck --include Sprites -o out_sprites
 
-# 不按原始路径归位 (纹理只放在 .godot/imported/ 下)
-python godot_pck_unpacker.py game.pck --no-organize
+# 6) 排除引擎缓存目录，其余全导出
+python godot_pck_unpacker.py game.pck --exclude .godot
 
-# 额外保留 .webp 原文件 / 额外保留原始 .ctex (用于工程重建)
-python godot_pck_unpacker.py game.pck --keep-webp --keep-raw
+# 7) 完全原样导出（不转换任何东西，用于研究包结构）
+python godot_pck_unpacker.py game.pck --no-convert --no-media --no-organize
 
-# 跳过 .import/.remap 导入元数据 (仅保留真实资源, 输出更干净)
-python godot_pck_unpacker.py game.pck --no-meta
+# 8) 单独开关演示
+python godot_pck_unpacker.py game.pck --no-convert      # 保留 .ctex/.stex
+python godot_pck_unpacker.py game.pck --no-media        # 保留 .sample/.fontdata
+python godot_pck_unpacker.py game.pck --no-organize     # 不归位到开发时路径
+python godot_pck_unpacker.py game.pck --keep-webp --keep-raw   # 额外留原件
+python godot_pck_unpacker.py game.pck --no-meta         # 不导 .import/.remap 元数据
 ```
 
 ## 选择性导出 (按分类/扩展名筛选)
@@ -81,6 +118,25 @@ python godot_pck_unpacker.py game.pck --exclude .godot
   - 同样按 `.import` 映射归位到开发时原名（如 `Sounds/Bump.wav`、`Fonts/…/Noto_Sans_JP.ttf`）；无映射时从 `foo.wav-<哈希>.sample` 反推
   - 可用 `--no-media` 关闭还原，保留原始 `.sample`/`.fontdata`
 - 加密文件 (PCK_FILE_ENCRYPTED) 自动跳过并提示
+
+## 常见问题 (FAQ)
+**Q: 解出来后一堆 1KB 的 `.import` / `.remap`，改成 `.png` 也打不开？**
+A: 它们是 Godot 的**导入元数据**（纯文本），不是图片。真实图片在 `.ctex` 里，本工具默认已转成 PNG。
+   不想要元数据就加 `--no-meta`（跳过不会丢失任何真实资源）。
+
+**Q: `.sample` / `.fontdata` 改后缀不能播放 / 不能安装？**
+A: 它们也是**打包后**格式。本工具默认会自动还原成 `.wav` / `.ttf`（需装 `zstandard` 才能还原字体）。
+   如果没装 zstandard，字体就只保留原始 `.fontdata`（不报错）。
+
+**Q: 为什么输出里还有 `.scn` / `.gdc` / `.res`？**
+A: 这是 Godot 4 的**打包后**场景 / 编译后脚本 / 二进制资源，属于正常产物。
+   `.gdc` 是加密编译的字节码，本工具只解包不反编译。
+
+**Q: 怎么确认筛选会命中哪些文件？**
+A: 加 `--list` 预览，筛选参数对 `--list` 同样生效。
+
+**Q: 输出目录怎么定？**
+A: 不指定就是 `<pck名>_unpacked`，也可用 `-o 目录`。
 
 ## 依赖
 - 必须: Python 3 标准库
