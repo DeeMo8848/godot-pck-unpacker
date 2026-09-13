@@ -156,11 +156,25 @@ def parse_directory(f, hdr, fsize):
 
 # ---------- .import 映射 ----------
 def build_import_map(f, entries, fsize):
-    """扫描 .import 条目, 建立 ctex文件名 -> 原始资源路径 的映射。"""
+    """扫描 .import / .remap 条目, 建立 ctex文件名 -> 原始资源路径 的映射。
+
+    Godot 4 工程通常用 .import 记录导入元数据; 部分配置/导出产物改用 .remap。
+    二者都是纯文本元数据(约 1KB), 真正纹理在 res://.godot/imported/*.ctex。
+    """
     imp_map = {}
-    pat = re.compile(r'path="res://\.godot/imported/([^"]+\.ctex)"')
+    # .import: 形如  path="res://.godot/imported/foo.png-<hash>.ctex"
+    pat_import = re.compile(r'path="(res://\.godot/imported/[^"]+\.ctex)"')
+    # .remap:  形如  loaded_paths=["res://.godot/imported/foo.png-<hash>.ctex"]
+    #             或    path="res://.godot/imported/foo.png-<hash>.ctex"
+    pat_remap = re.compile(
+        r'(?:loaded_paths=\[|path=)"?(res://\.godot/imported/[^"\]]+\.ctex)"?')
     for ent in entries:
-        if not ent["path"].endswith(".import"):
+        path = ent["path"]
+        if path.endswith(".import"):
+            suf, pat = ".import", pat_import
+        elif path.endswith(".remap"):
+            suf, pat = ".remap", pat_remap
+        else:
             continue
         if ent["abs_offset"] + ent["size"] > fsize:
             continue
@@ -171,8 +185,8 @@ def build_import_map(f, entries, fsize):
             continue
         m = pat.search(content)
         if m:
-            ctex_name = m.group(1)
-            orig = ent["path"][: -len(".import")]
+            ctex_name = m.group(1).rsplit("/", 1)[-1]
+            orig = path[: -len(suf)]
             imp_map[ctex_name] = orig
     return imp_map
 
@@ -209,6 +223,22 @@ def convert_texture(data, ext):
     return None, None
 
 
+def _ctex_basename(ctex_path):
+    """从 .ctex 文件名反推原始文件名(无 .import/.remap 映射时的回退)。
+
+    Godot 导入纹理命名: <原始名>-<MD5哈希>.ctex, 如 foo.png-1a2b3c.ctex。
+    这里去掉末尾 -<hash>, 并把扩展名统一成 .png, 得到 foo.png。
+    """
+    base = os.path.basename(ctex_path)
+    if base.lower().endswith(".ctex"):
+        base = base[:-5]
+    m = re.match(r"^(.*?)(?:-[0-9a-fA-F]{16,64})?$", base)
+    name = m.group(1) if m else base
+    # name 可能已带原扩展名(如 5.png), 统一去掉后补 .png, 得到干净的 5.png
+    stem, _ = os.path.splitext(name)
+    return (stem or name) + ".png"
+
+
 def maybe_png(raw, fmt, out_path):
     """尝试用 Pillow 把 WebP/PNG 转成 PNG; 失败则原样保存。"""
     base, _ = os.path.splitext(out_path)
@@ -243,6 +273,7 @@ def passes_filter(filt_path, src_ext, include, exclude, exts):
     fp = filt_path.lower()
 
     def match(p):
+        p = p.lower()
         if p.startswith("."):
             return (fp.endswith(p) or fp == p
                     or fp.startswith(p + "/") or ("/" + p + "/") in fp)
@@ -263,7 +294,7 @@ def passes_filter(filt_path, src_ext, include, exclude, exts):
 
 # ---------- 主解包 ----------
 def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
-           keep_raw=False, list_only=False, quiet=False,
+           keep_raw=False, list_only=False, quiet=False, skip_meta=False,
            include=None, exclude=None, exts=None,
            log_cb=None, progress_cb=None, cancel_cb=None):
     """解包主函数。
@@ -307,6 +338,8 @@ def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
                     rel = rel[len(RES_PREFIX):]
                 rel = rel.replace("\x00", "")
                 ext = os.path.splitext(rel)[1].lower()
+                if skip_meta and ext in (".import", ".remap"):
+                    continue
                 # 纹理以归位后的原始路径展示 (与提取一致)
                 filt_key = rel
                 if ext in (".ctex", ".stex"):
@@ -319,7 +352,7 @@ def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
             return
 
         # 重新打开以便按需 seek 读取 (上面 build_import_map 已 seek)
-        extracted = skipped = errors = enc = skipped_filter = 0
+        extracted = skipped = errors = enc = skipped_filter = skipped_meta = 0
         for idx, ent in enumerate(entries):
             if cancel_cb and cancel_cb():
                 cancelled = True
@@ -338,6 +371,11 @@ def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
 
             out_path = os.path.join(output_dir, rel)
             ext = os.path.splitext(rel)[1].lower()
+
+            # 可选跳过导入元数据 (.import/.remap) —— 纯文本, 改后缀也打不开, 非可用资源
+            if skip_meta and ext in (".import", ".remap"):
+                skipped_meta += 1
+                continue
 
             # 筛选: 以最终输出路径为准 (纹理归位后落在原始目录)
             filt_key = rel
@@ -383,9 +421,11 @@ def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
                             maybe_png(img, fmt, orig_png)
                             wrote = True
                     if not wrote:
-                        # 无映射: 写到 res:// 对应位置
-                        os.makedirs(os.path.dirname(out_path) or output_dir, exist_ok=True)
-                        maybe_png(img, fmt, out_path)
+                        # 无映射: 用 .ctex 文件名反推原始名, 落到同目录 (.godot/imported/)
+                        fb = _ctex_basename(ent["path"])
+                        fb_path = os.path.join(os.path.dirname(out_path) or output_dir, fb)
+                        os.makedirs(os.path.dirname(fb_path) or output_dir, exist_ok=True)
+                        maybe_png(img, fmt, fb_path)
                     extracted += 1
                     if keep_webp:
                         wp = os.path.splitext(
@@ -410,8 +450,8 @@ def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
                 _log("[!] 写入失败 %s: %s" % (ent["path"], e), is_err=True)
                 errors += 1
 
-        _log("\n[完成] 提取 %d, 跳过(加密) %d, 筛选排除 %d, 错误 %d%s"
-             % (extracted, enc, skipped_filter, errors,
+        _log("\n[完成] 提取 %d, 跳过(加密) %d, 跳过元数据 %d, 筛选排除 %d, 错误 %d%s"
+             % (extracted, enc, skipped_meta, skipped_filter, errors,
                 ("  (已取消)" if cancelled else "")))
         _log("[完成] 输出目录: %s" % output_dir)
 
@@ -430,6 +470,8 @@ def main():
                     help="转 PNG 时额外保留 .webp 原文件")
     ap.add_argument("--keep-raw", action="store_true",
                     help="额外保留原始 .ctex/.stex (用于 Godot 工程重建)")
+    ap.add_argument("--no-meta", action="store_true",
+                    help="不导出导入元数据 (.import/.remap, 纯文本约1KB, 改后缀也打不开)")
     ap.add_argument("--include", help="只导出这些路径前缀 (逗号/空格分隔, 如 Sprites,Sounds,UI)")
     ap.add_argument("--exclude", help="排除这些路径前缀 (逗号/空格分隔)")
     ap.add_argument("--ext", help="只导出这些源扩展名 (逗号/空格分隔, 如 ctex,scn,gd)")
@@ -453,6 +495,7 @@ def main():
             keep_webp=args.keep_webp,
             keep_raw=args.keep_raw,
             list_only=args.list,
+            skip_meta=args.no_meta,
             quiet=args.quiet,
             include=_split_list(args.include),
             exclude=_split_list(args.exclude),

@@ -28,6 +28,9 @@ python godot_pck_unpacker.py game.pck --no-organize
 
 # 额外保留 .webp 原文件 / 额外保留原始 .ctex (用于工程重建)
 python godot_pck_unpacker.py game.pck --keep-webp --keep-raw
+
+# 跳过 .import/.remap 导入元数据 (仅保留真实资源, 输出更干净)
+python godot_pck_unpacker.py game.pck --no-meta
 ```
 
 ## 选择性导出 (按分类/扩展名筛选)
@@ -62,9 +65,10 @@ python godot_pck_unpacker.py game.pck --exclude .godot
 ## 输出说明
 - 所有文件按 `res://` 虚拟路径解包到输出目录
 - 纹理 (`.ctex` / `.stex`) 自动提取内嵌图像并转成 PNG：
-  - 优先按 `.import` 映射归位到开发时的原始路径 (如 `Sprites/Logo_Layers/5.png`)
-  - 无法映射时放在 `.godot/imported/` 对应位置
+  - 优先按 `.import` / `.remap` 映射归位到开发时的原始路径 (如 `Sprites/Logo_Layers/5.png`)
+  - 无法映射时，用 `.ctex` 文件名反推原始名（`foo.png-<哈希>.ctex` → `foo.png`），落在 `.godot/imported/` 下
   - 没有 Pillow 时回退保存为 `.webp` (浏览器/系统照片查看器可直接打开)
+- **关于 `.import` / `.remap`**：这俩是 Godot 的**导入元数据**（约 1KB 纯文本），记录纹理等资源的导入方式，**不是图片本身**——把它们改后缀成 `.png` 也打不开。真实图片永远在 `.ctex` 里，本工具会转成 PNG。默认**会一并导出**全部资源（不做跳过）；若想让输出更干净、只保留真实资源，用 CLI `--no-meta` 或 GUI 勾选“跳过 .import/.remap 元数据”。
 - 加密文件 (PCK_FILE_ENCRYPTED) 自动跳过并提示
 
 ## 依赖
@@ -104,7 +108,7 @@ dist\GodotPCKUnpacker.exe
     - 图像 = `.ctex/.stex`（自动转 PNG 并归位到原始路径）+ 原始位图
     - 音效 = `.wav/.ogg/.mp3/.opus/.flac` 等
     - 字体 / 脚本 / 场景 / 着色器 按对应扩展名筛选
-- **选项**：纹理归位到原始路径（默认开）、纹理转为 PNG（默认开）、额外保留原始纹理（用于 Godot 工程重建）
+- **选项**：纹理归位到原始路径（默认开）、纹理转为 PNG（默认开）、额外保留原始纹理（用于 Godot 工程重建）、跳过 .import/.remap 元数据（默认**不**跳过；勾选后只保留真实资源，输出更干净）
 - **进度条 + 日志 + 取消**：解包在后台线程进行，不卡界面；可随时点「取消」中止
 - 选好文件后会自动**分析**并显示 `Godot 版本 | 共 N 文件 | 各分类数量`，方便决定导出哪些
 

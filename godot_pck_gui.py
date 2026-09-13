@@ -72,6 +72,8 @@ class App:
         self.organize_var = tk.BooleanVar(value=True)
         self.convert_var = tk.BooleanVar(value=True)
         self.keepraw_var = tk.BooleanVar(value=False)
+        self.skip_meta_var = tk.BooleanVar(value=False)  # 默认不跳过 -> 导出全部资源
+        self._dropped = []  # 拖拽: 由 WNDPROC 填充, 主线程 _poll 消费
         self.status_var = tk.StringVar(value="请选择或拖入 .pck 文件")
         self.info_var = tk.StringVar(value="")
 
@@ -118,9 +120,14 @@ class App:
         # 选项
         f4 = ttk.LabelFrame(self.root, text="选项")
         f4.pack(fill="x", padx=10, pady=6)
-        ttk.Checkbutton(f4, text="纹理归位到原始路径", variable=self.organize_var).pack(side="left", padx=8)
-        ttk.Checkbutton(f4, text="纹理转为 PNG", variable=self.convert_var).pack(side="left", padx=8)
-        ttk.Checkbutton(f4, text="额外保留原始纹理(工程重建)", variable=self.keepraw_var).pack(side="left", padx=8)
+        row1 = ttk.Frame(f4)
+        row1.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(row1, text="纹理归位到原始路径", variable=self.organize_var).pack(side="left", padx=8)
+        ttk.Checkbutton(row1, text="纹理转为 PNG", variable=self.convert_var).pack(side="left", padx=8)
+        ttk.Checkbutton(row1, text="额外保留原始纹理(工程重建)", variable=self.keepraw_var).pack(side="left", padx=8)
+        row2 = ttk.Frame(f4)
+        row2.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(row2, text="跳过 .import/.remap 元数据 (勾选后只保留真实资源, 输出更干净)", variable=self.skip_meta_var).pack(side="left", padx=8)
 
         # 分析信息
         ttk.Label(self.root, textvariable=self.info_var, foreground="darkgreen").pack(
@@ -240,7 +247,7 @@ class App:
             pck_path=p, output_dir=out,
             convert=self.convert_var.get(), organize=self.organize_var.get(),
             keep_webp=False, keep_raw=self.keepraw_var.get(),
-            list_only=False, quiet=False,
+            list_only=False, quiet=False, skip_meta=self.skip_meta_var.get(),
             include=None, exclude=None, exts=exts,
             log_cb=self._log_cb, progress_cb=self._prog_cb,
             cancel_cb=lambda: self.cancelled,
@@ -294,6 +301,11 @@ class App:
                 if total:
                     self.progress["value"] = cur * 100.0 / total
                     self.status_var.set("%d / %d" % (cur, total))
+            # 处理拖入的文件: 由 WNDPROC 填充 self._dropped, 此处才触碰 Tk (主线程安全)
+            if self._dropped:
+                files = self._dropped
+                self._dropped = []
+                self._on_drop(files)
         except Exception:
             pass
         self.root.after(120, self._poll)
@@ -301,30 +313,58 @@ class App:
     # ---------------- 拖拽 ----------------
     def _setup_dragdrop(self):
         hwnd = self.root.winfo_id()
+        if not hwnd:
+            return
         WNDPROC = ctypes.WINFUNCTYPE(
             wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
-        app = self
+        proc_ref = {}
 
         def proc(hwnd, msg, wp, lp):
-            if msg == _WM_DROPFILES:
-                count = _shell32.DragQueryFileW(wp, 0xFFFFFFFF, None, 0)
-                files = []
-                for i in range(count):
-                    n = _shell32.DragQueryFileW(wp, i, None, 0)
-                    buf = ctypes.create_unicode_buffer(n + 1)
-                    _shell32.DragQueryFileW(wp, i, buf, n + 1)
-                    files.append(buf.value)
-                _shell32.DragFinish(wp)
-                app.root.after(0, app._on_drop, files)
+            # 关键(崩溃根因): 回调由操作系统在 Tk 的消息泵内部直接调用,
+            # 此刻若调用任何 Tk/Tcl API (如 root.after) 会造成 Tcl 重入 -> 栈损坏
+            # -> "Fatal Python error: PyEval_RestoreThread ... " 进程崩溃。
+            # 因此这里只做纯 Python/shell32 操作: 把路径存进普通列表, 绝不触碰 Tk。
+            # 由主线程 _poll 定时消费 self._dropped 再回填界面。
+            try:
+                if msg == _WM_DROPFILES:
+                    try:
+                        count = _shell32.DragQueryFileW(wp, 0xFFFFFFFF, None, 0)
+                    except Exception:
+                        count = 0
+                    if count and count < 1000:
+                        for i in range(count):
+                            try:
+                                n = _shell32.DragQueryFileW(wp, i, None, 0)
+                                if not n or n > 8192:
+                                    continue
+                                buf = ctypes.create_unicode_buffer(int(n) + 1)
+                                _shell32.DragQueryFileW(wp, i, buf, int(n) + 1)
+                                self._dropped.append(buf.value)
+                            except Exception:
+                                continue
+                    try:
+                        _shell32.DragFinish(wp)
+                    except Exception:
+                        pass
+                    return 0
+                if proc_ref.get("old"):
+                    return _user32.CallWindowProcW(proc_ref["old"], hwnd, msg, wp, lp)
                 return 0
-            return _user32.CallWindowProcW(old_proc, hwnd, msg, wp, lp)
+            except Exception:
+                return 0
 
         new_proc = WNDPROC(proc)
-        old_proc = ctypes.c_void_p(
-            _user32.SetWindowLongPtrW(hwnd, _GWL_WNDPROC, new_proc))
-        app.root._drop_proc = new_proc  # 保持引用, 防止被 GC
-        ex = _user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
-        _user32.SetWindowLongW(hwnd, _GWL_EXSTYLE, ex | _WS_EX_ACCEPTFILES)
+        old_val = _user32.SetWindowLongPtrW(hwnd, _GWL_WNDPROC, new_proc)
+        if not old_val:
+            return  # 子类化失败则放弃拖拽(不影响其余功能), 避免崩溃
+        proc_ref["old"] = ctypes.c_void_p(old_val)
+        self._drop_proc = new_proc      # 保持引用, 防止被 GC
+        self.root._drop_proc = new_proc
+        try:
+            ex = _user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
+            _user32.SetWindowLongW(hwnd, _GWL_EXSTYLE, ex | _WS_EX_ACCEPTFILES)
+        except Exception:
+            pass
 
     def _on_drop(self, files):
         if files:

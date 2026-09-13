@@ -4,6 +4,7 @@ data.pck
 # 解包产物 (本地验证用, 不入库)
 extracted_assets/
 extracted_assets_v2/
+extracted_images/
 data_unpacked/
 data_unpacked_v2/
 
