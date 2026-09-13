@@ -13,12 +13,15 @@ Godot PCK Unpacker  ——  通用 Godot 资源包解包工具
   - 自动识别 PCK 版本 (读 FormatVersion)
   - 解包全部文件, 保留 res:// 目录结构
   - 纹理 (Godot4 .ctex / Godot3 .stex) 自动转成 PNG (或 WebP 回退)
-  - 利用 .import 映射把纹理归位到开发时的原始路径 (干净文件名)
+  - 音频 (.sample) 自动还原成可播放的 .wav
+  - 字体 (.fontdata) 自动还原成可安装的 .ttf/.otf
+  - 利用 .import 映射把纹理/音频/字体归位到开发时的原始路径 (干净文件名)
   - 加密文件自动跳过并告警
 
 依赖:
   - 仅需 Python 3 (标准库)
-  - 可选: Pillow  (用于把 WebP 转成 PNG; 没有则直接保存 .webp)
+  - 可选: Pillow     (用于把 WebP 转成 PNG; 没有则直接保存 .webp)
+  - 可选: zstandard  (用于解压 .fontdata; 没有则跳过字体转换, 保留原始文件)
 
 用法:
   python godot_pck_unpacker.py game.pck
@@ -156,18 +159,20 @@ def parse_directory(f, hdr, fsize):
 
 # ---------- .import 映射 ----------
 def build_import_map(f, entries, fsize):
-    """扫描 .import / .remap 条目, 建立 ctex文件名 -> 原始资源路径 的映射。
+    """扫描 .import / .remap 条目, 建立 导入产物文件名 -> 原始资源路径 的映射。
 
     Godot 4 工程通常用 .import 记录导入元数据; 部分配置/导出产物改用 .remap。
-    二者都是纯文本元数据(约 1KB), 真正纹理在 res://.godot/imported/*.ctex。
+    二者都是纯文本元数据(约 1KB)。真正产物在 res://.godot/imported/ 下:
+      纹理 foo.png-<hash>.ctex / 音频 foo.wav-<hash>.sample / 字体 foo.ttf-<hash>.fontdata
+    映射后即可把产物还原成开发时的原始路径与文件名。
     """
     imp_map = {}
     # .import: 形如  path="res://.godot/imported/foo.png-<hash>.ctex"
-    pat_import = re.compile(r'path="(res://\.godot/imported/[^"]+\.ctex)"')
-    # .remap:  形如  loaded_paths=["res://.godot/imported/foo.png-<hash>.ctex"]
-    #             或    path="res://.godot/imported/foo.png-<hash>.ctex"
+    pat_import = re.compile(r'path="(res://\.godot/imported/[^"]+)"')
+    # .remap:  形如  loaded_paths=["res://.godot/imported/..."]
+    #             或    path="res://.godot/imported/..."
     pat_remap = re.compile(
-        r'(?:loaded_paths=\[|path=)"?(res://\.godot/imported/[^"\]]+\.ctex)"?')
+        r'(?:loaded_paths=\[|path=)"?(res://\.godot/imported/[^"\]]+)"?')
     for ent in entries:
         path = ent["path"]
         if path.endswith(".import"):
@@ -185,9 +190,9 @@ def build_import_map(f, entries, fsize):
             continue
         m = pat.search(content)
         if m:
-            ctex_name = m.group(1).rsplit("/", 1)[-1]
+            dest_name = m.group(1).rsplit("/", 1)[-1]
             orig = path[: -len(suf)]
-            imp_map[ctex_name] = orig
+            imp_map[dest_name] = orig
     return imp_map
 
 
@@ -258,6 +263,333 @@ def maybe_png(raw, fmt, out_path):
         return fb_path, ext[1:].upper()
 
 
+# ---------- Godot 4 二进制资源 (RSRC / RSCC) 解析 ----------
+# 打包后的音频为 .sample (AudioStreamWAV 资源, 内含裸 PCM),
+# 字体为 .fontdata (FontFile 资源, 用 RSCC+zstd 压缩保存)。
+# 二者都不是能直接播放/安装的文件, 需按下述格式还原成真 .wav / .ttf。
+# 参考 Godot 源码 resource_format_binary.cpp / file_access_compressed.cpp。
+
+_V_NIL, _V_BOOL, _V_INT, _V_FLOAT, _V_STRING = 1, 2, 3, 4, 5
+_V_VEC2, _V_VEC2I, _V_RECT2, _V_RECT2I = 10, 45, 11, 46
+_V_VEC3, _V_VEC3I, _V_VEC4, _V_VEC4I = 12, 47, 50, 51
+_V_PLANE, _V_QUAT, _V_AABB, _V_BASIS = 13, 14, 15, 16
+_V_XFORM3, _V_XFORM2, _V_COLOR, _V_NODEPATH, _V_RID = 17, 18, 20, 22, 23
+_V_OBJECT, _V_DICT, _V_ARRAY, _V_PBA = 24, 26, 30, 31
+_V_PI32, _V_PF32, _V_PSTR, _V_PV3, _V_PCOL, _V_PV2 = 32, 33, 34, 35, 36, 37
+_V_INT64, _V_DBL, _V_SNAME, _V_PI64, _V_PF64, _V_PROJ = 40, 41, 44, 48, 49, 52
+
+# 打包后可转换的媒体扩展名 -> 转换后可能的后缀
+MEDIA_EXT = {".sample": ("wav",), ".fontdata": ("ttf", "otf"),
+             ".oggvorbisstr": ("ogg",), ".mp3str": ("mp3",)}
+
+
+def _rd_ustr(b, o):
+    """读 Godot unicode 字符串 (u32 长度含 NUL + 字节)。"""
+    n = struct.unpack_from("<I", b, o)[0]
+    return b[o + 4:o + 4 + max(0, n - 1)].decode("utf-8", "replace"), o + 4 + n
+
+
+def _scan_string_table(b, start):
+    """定位字符串表。header 保留区字节数随版本而变, 故采用扫描。"""
+    N = len(b)
+    for st in range(start, min(start + 4096, N - 8)):
+        cnt = struct.unpack_from("<I", b, st)[0]
+        if not (1 <= cnt <= 65535):
+            continue
+        q = st + 4
+        names = []
+        ok = True
+        for _ in range(cnt):
+            if q + 4 > N:
+                ok = False
+                break
+            ln = struct.unpack_from("<I", b, q)[0]
+            if not (1 <= ln <= 4096) or q + 4 + ln > N:
+                ok = False
+                break
+            raw = b[q + 4:q + 4 + ln]
+            if any(c != 0 and (c < 32 or c > 126) for c in raw):
+                ok = False
+                break
+            names.append(raw.rstrip(b"\x00").decode("utf-8", "replace"))
+            q = q + 4 + ln
+        if ok and len(names) == cnt:
+            return names, q
+    raise ValueError("未找到字符串表 (非预期格式)")
+
+
+def _rd_variant(b, o, rdbl):
+    """读一个 Variant, 返回 (值, 新偏移)。仅需跳过+取用常见类型。"""
+    t = struct.unpack_from("<I", b, o)[0]
+    o += 4
+    if t == _V_NIL:
+        return None, o
+    if t == _V_BOOL:
+        return bool(struct.unpack_from("<I", b, o)[0]), o + 4
+    if t == _V_INT:
+        return struct.unpack_from("<i", b, o)[0], o + 4
+    if t == _V_INT64:
+        return struct.unpack_from("<q", b, o)[0], o + 8
+    if t == _V_FLOAT:
+        if rdbl:
+            return struct.unpack_from("<d", b, o)[0], o + 8
+        return struct.unpack_from("<f", b, o)[0], o + 4
+    if t == _V_DBL:
+        return struct.unpack_from("<d", b, o)[0], o + 8
+    if t in (_V_STRING, _V_SNAME):
+        return _rd_ustr(b, o)
+    if t == _V_PBA:
+        n = struct.unpack_from("<I", b, o)[0]
+        return b[o + 4:o + 4 + n], o + 4 + n
+    _packed = {_V_PI32: 4, _V_PF32: 4, _V_PI64: 8, _V_PF64: 8, _V_PV2: 8,
+               _V_PV3: 12, _V_PCOL: 16}
+    if t in _packed:
+        n = struct.unpack_from("<I", b, o)[0]
+        return ("packed", t, n), o + 4 + _packed[t] * n
+    if t == _V_PSTR:
+        n = struct.unpack_from("<I", b, o)[0]
+        o += 4
+        for _ in range(n):
+            _, o = _rd_ustr(b, o)
+        return ("packed_str", n), o
+    if t == _V_OBJECT:
+        sub = struct.unpack_from("<I", b, o)[0]
+        o += 4
+        if sub in (1, 2):
+            return ("object", sub, struct.unpack_from("<I", b, o)[0]), o + 4
+        return ("object", sub), o
+    if t in (_V_ARRAY, _V_DICT):
+        n = struct.unpack_from("<I", b, o)[0]
+        o += 4
+        for _ in range(n if t == _V_ARRAY else n * 2):
+            _, o = _rd_variant(b, o, rdbl)
+        return ("array" if t == _V_ARRAY else "dict", n), o
+    if t == _V_NODEPATH:
+        nc = struct.unpack_from("<I", b, o)[0]
+        sc = struct.unpack_from("<I", b, o + 4)[0]
+        o += 12
+        for _ in range(nc + sc):
+            idx = struct.unpack_from("<I", b, o)[0]
+            o += 4
+            if idx & 0x80000000:
+                o += idx & 0x7FFFFFFF
+        return ("nodepath",), o
+    if t == _V_RID:
+        return ("rid",), o + 8
+    _fixed = {_V_VEC2: 8, _V_VEC2I: 8, _V_RECT2: 16, _V_RECT2I: 16,
+              _V_VEC3: 12, _V_VEC3I: 12, _V_VEC4: 16, _V_VEC4I: 16,
+              _V_PLANE: 16, _V_QUAT: 16, _V_AABB: 24, _V_BASIS: 36,
+              _V_XFORM3: 48, _V_XFORM2: 24, _V_PROJ: 64}
+    if t in _fixed:
+        n = _fixed[t]
+        if rdbl:
+            n = n // 4 * 8
+        return ("fixed", t), o + n
+    raise ValueError("未支持的 Variant 类型: %d" % t)
+
+
+def parse_rsrc(buf):
+    """解析 Godot 4 二进制资源 (RSRC), 返回 {type, resources:[{type, props}]}。"""
+    if buf[:4] != b"RSRC":
+        raise ValueError("不是 RSRC 资源 (magic=%r)" % buf[:4])
+    p = 4
+    vmaj, vmin, vfmt = (struct.unpack_from("<I", buf, p + 8)[0],
+                        struct.unpack_from("<I", buf, p + 12)[0],
+                        struct.unpack_from("<I", buf, p + 16)[0])
+    p += 20
+    type_str, p = _rd_ustr(buf, p)
+    p += 8                       # importmd_ofs
+    flags = struct.unpack_from("<I", buf, p)[0]
+    p += 4
+    using_uids = bool(flags & 2)
+    real_double = bool(flags & 4)
+    p += 8                       # uid (无 uid 时为保留 0)
+    names, p = _scan_string_table(buf, p)
+    ext_n = struct.unpack_from("<I", buf, p)[0]
+    p += 4
+    for _ in range(ext_n):
+        p += 4                   # 类型在字符串表中的索引
+        _, p = _rd_ustr(buf, p)  # 路径
+        if using_uids:
+            p += 8               # uid
+    int_n = struct.unpack_from("<I", buf, p)[0]
+    p += 4
+    for _ in range(int_n):
+        _, p = _rd_ustr(buf, p)
+        p += 8                   # offset
+    resources = []
+    for _ in range(int_n):
+        rt, p = _rd_ustr(buf, p)
+        pc = struct.unpack_from("<I", buf, p)[0]
+        p += 4
+        props = {}
+        for _ in range(pc):
+            ni = struct.unpack_from("<I", buf, p)[0]
+            p += 4
+            val, p = _rd_variant(buf, p, real_double)
+            props[names[ni] if 0 <= ni < len(names) else ("#%d" % ni)] = val
+        resources.append({"type": rt, "props": props})
+    return {"type": type_str, "ver": (vmaj, vmin, vfmt),
+            "flags": flags, "resources": resources}
+
+
+def decompress_rscc(buf):
+    """解压 Godot 压缩资源容器 (RSCC, FileAccessCompressed + zstd 块)。
+
+    注意: 压缩保存的资源内部会省略开头的 'RSRC' 魔术字。
+    """
+    if buf[:4] != b"RSCC":
+        raise ValueError("不是 RSCC 容器")
+    cmode = struct.unpack_from("<I", buf, 4)[0]
+    block_size = struct.unpack_from("<I", buf, 8)[0]
+    total = struct.unpack_from("<I", buf, 12)[0]
+    if cmode != 2:
+        raise ValueError("RSCC 压缩模式 %d 非 ZSTD" % cmode)
+    bc = (total // block_size) + 1
+    sizes = [struct.unpack_from("<I", buf, 16 + 4 * i)[0] for i in range(bc)]
+    pos = 16 + 4 * bc
+    try:
+        import zstandard as zstd
+    except ImportError:
+        raise RuntimeError("解压 .fontdata 需要 zstandard 模块 (pip install zstandard)")
+    dctx = zstd.ZstdDecompressor()
+    out = bytearray()
+    for s in sizes:
+        out += dctx.decompress(buf[pos:pos + s], max_output_size=block_size)
+        pos += s
+    return bytes(out[:total]) if total else bytes(out)
+
+
+_FONT_SIGS = ((b"\x00\x01\x00\x00", "ttf"), (b"OTTO", "otf"),
+              (b"true", "ttf"), (b"typ1", "ttf"),
+              (b"ttcf", "ttc"), (b"wOFF", "woff"), (b"wOF2", "woff2"))
+
+
+def _font_sig(d):
+    for sig, ext in _FONT_SIGS:
+        if d[:len(sig)] == sig:
+            return ext
+    return None
+
+
+def _find_pba(buf, sig):
+    """在 RSRC 中查找内容以 sig 开头的 PackedByteArray, 返回其字节。"""
+    i = 0
+    tag = struct.pack("<I", _V_PBA)
+    while True:
+        j = buf.find(tag, i)
+        if j < 0:
+            return None
+        if j + 8 <= len(buf):
+            ln = struct.unpack_from("<I", buf, j + 4)[0]
+            if 0 < ln <= len(buf) - (j + 8) and buf[j + 8:j + 8 + len(sig)] == sig:
+                return bytes(buf[j + 8:j + 8 + ln])
+        i = j + 1
+
+
+def build_wav(pcm, fmt, mix_rate, stereo):
+    """把裸 PCM 封装成标准 RIFF/WAVE。fmt: 0=8bit 1=16bit (Godot 已交错)。"""
+    if fmt == 1:
+        bits = 16
+    elif fmt == 0:
+        bits = 8
+    else:
+        return None            # 2=IMA ADPCM, 3=QOA: 非 PCM, 不处理
+    ch = 2 if stereo else 1
+    hdr = (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE"
+           + b"fmt " + struct.pack("<IHHIIHH", 16, 1, ch, mix_rate,
+                                   mix_rate * ch * bits // 8, ch * bits // 8, bits)
+           + b"data" + struct.pack("<I", len(pcm)))
+    return hdr + pcm
+
+
+def convert_sample(buf):
+    """.sample (AudioStreamWAV) -> wav 字节。失败返回 None。"""
+    r = parse_rsrc(buf)
+    if r["type"] != "AudioStreamWAV" or not r["resources"]:
+        return None
+    props = r["resources"][0]["props"]
+    data = props.get("data")
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return None
+    return build_wav(bytes(data), int(props.get("format", 0)),
+                     int(props.get("mix_rate", 44100) or 44100),
+                     bool(props.get("stereo", False)))
+
+
+def convert_fontdata(buf):
+    """.fontdata (FontFile, RSCC/zstd) -> (字体字节, 后缀)。失败返回 None。"""
+    inner = decompress_rscc(buf)
+    e = _font_sig(inner)
+    if e:
+        return inner, e
+    body = inner if inner[:4] == b"RSRC" else (b"RSRC" + inner)
+    try:
+        r = parse_rsrc(body)
+    except Exception:
+        r = None
+    if r:
+        for res in r["resources"]:
+            d = res["props"].get("data")
+            if isinstance(d, (bytes, bytearray)) and len(d) > 64:
+                e = _font_sig(d)
+                if e:
+                    return bytes(d), e
+                if bytes(d[:4]) not in (b"\x00\x00\x00\x00", b"RSRC"):
+                    return bytes(d), "ttf"
+    for sig, ext in _FONT_SIGS:
+        x = _find_pba(body, sig)
+        if x:
+            return x, ext
+    return None
+
+
+def extract_ogg(buf):
+    """.oggvorbisstr -> 原始 ogg 流字节。"""
+    if buf[:4] == b"OggS":
+        return buf
+    return _find_pba(buf, b"OggS")
+
+
+def extract_mp3(buf):
+    """.mp3str -> 原始 mp3 字节。"""
+    for sig in (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        if buf[:len(sig)] == sig:
+            return buf
+        d = _find_pba(buf, sig)
+        if d:
+            return d
+    return None
+
+
+def convert_media_asset(data, ext):
+    """把打包后的媒体资源还原成可用格式, 返回 (字节, 后缀) 或 None。"""
+    try:
+        if ext == ".sample":
+            w = convert_sample(data)
+            return (w, "wav") if w else None
+        if ext == ".fontdata":
+            return convert_fontdata(data)
+        if ext == ".oggvorbisstr":
+            o = extract_ogg(data)
+            return (o, "ogg") if o else None
+        if ext == ".mp3str":
+            m = extract_mp3(data)
+            return (m, "mp3") if m else None
+    except Exception:
+        return None
+    return None
+
+
+def _media_basename(raw_path, out_ext):
+    """无 .import 映射时的回退名称: 从 foo.wav-<hash>.sample 反推 foo.wav。"""
+    base = os.path.splitext(os.path.basename(raw_path))[0]   # 去 .sample
+    base = re.sub(r"-[0-9a-fA-F]{16,64}$", "", base)         # 去 -<hash>
+    if not os.path.splitext(base)[1]:
+        base += "." + out_ext
+    return base
+
+
 # ---------- 筛选 ----------
 def _split_list(s):
     """把 'a, b c' 这类字符串拆成小写列表 (去前导 /)。空返回 None。"""
@@ -266,8 +598,8 @@ def _split_list(s):
     return [x.strip().lower().lstrip("/") for x in re.split(r"[,\s]+", s) if x.strip()]
 
 
-def passes_filter(filt_path, src_ext, include, exclude, exts):
-    """filt_path: 用于前缀/后缀匹配的(归位后)路径; src_ext: 源文件扩展名(用于 --ext)。
+def passes_filter(filt_path, ext_keys, include, exclude, exts):
+    """filt_path: 用于前缀/后缀匹配的(归位后)路径; ext_keys: 可接受的扩展名(源+转换后)。
     include/exclude 规则: 含'/'当路径片段, 以'.'开头且无'/'当扩展名(后缀), 其余当路径前缀。
     """
     fp = filt_path.lower()
@@ -287,15 +619,17 @@ def passes_filter(filt_path, src_ext, include, exclude, exts):
         if not any(match(p) for p in include):
             return False
     if exts:
-        if src_ext.lower().lstrip(".") not in exts:
+        if isinstance(ext_keys, str):
+            ext_keys = [ext_keys]
+        if not any(k.lower().lstrip(".") in exts for k in ext_keys):
             return False
     return True
 
 
 # ---------- 主解包 ----------
-def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
-           keep_raw=False, list_only=False, quiet=False, skip_meta=False,
-           include=None, exclude=None, exts=None,
+def unpack(pck_path, output_dir, convert=True, organize=True, convert_media=True,
+           keep_webp=False, keep_raw=False, list_only=False, quiet=False,
+           skip_meta=False, include=None, exclude=None, exts=None,
            log_cb=None, progress_cb=None, cancel_cb=None):
     """解包主函数。
     log_cb(msg, is_err)   : 日志回调 (不传则打印到控制台)
@@ -329,7 +663,27 @@ def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
         total = len(entries)
 
         # 构建 .import 映射 (供归位/预览使用, 只读不写)
-        imp_map = build_import_map(f, entries, fsize) if (convert and organize) else {}
+        imp_map = (build_import_map(f, entries, fsize)
+                   if organize and (convert or convert_media) else {})
+
+        def _out_exts(ext):
+            """可接受的扩展名: 源扩展名 + 转换后可能的后缀 (便于 --ext wav/ttf/png)。"""
+            keys = [ext.lstrip(".")]
+            if convert and ext in (".ctex", ".stex"):
+                keys.append("png")
+            if convert_media and ext in MEDIA_EXT:
+                keys.extend(MEDIA_EXT[ext])
+            return keys
+
+        def _filt_key(rel, ext):
+            """定位后的路径 (可转换资产用原始开发路径, 便于 --include Sounds 等)。"""
+            conv = ((convert and ext in (".ctex", ".stex"))
+                    or (convert_media and ext in MEDIA_EXT))
+            if organize and conv:
+                bn = os.path.basename(rel)
+                if bn in imp_map:
+                    return imp_map[bn].lstrip("/")
+            return rel
 
         if list_only:
             for e in entries:
@@ -340,13 +694,9 @@ def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
                 ext = os.path.splitext(rel)[1].lower()
                 if skip_meta and ext in (".import", ".remap"):
                     continue
-                # 纹理以归位后的原始路径展示 (与提取一致)
-                filt_key = rel
-                if ext in (".ctex", ".stex"):
-                    bn = os.path.basename(rel)
-                    if bn in imp_map:
-                        filt_key = imp_map[bn].lstrip("/")
-                if not passes_filter(filt_key, ext, include, exclude, exts):
+                # 纹理/音频/字体以归位后的原始路径展示 (与提取一致)
+                filt_key = _filt_key(rel, ext)
+                if not passes_filter(filt_key, _out_exts(ext), include, exclude, exts):
                     continue
                 _log("  %8d  %s" % (e["size"], filt_key))
             return
@@ -377,13 +727,9 @@ def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
                 skipped_meta += 1
                 continue
 
-            # 筛选: 以最终输出路径为准 (纹理归位后落在原始目录)
-            filt_key = rel
-            if convert and organize and ext in (".ctex", ".stex"):
-                bn = os.path.basename(ent["path"])
-                if bn in imp_map:
-                    filt_key = imp_map[bn].lstrip("/")
-            if not passes_filter(filt_key, ext, include, exclude, exts):
+            # 筛选: 以最终输出路径为准 (纹理/音频/字体归位后落在原始目录)
+            filt_key = _filt_key(rel, ext)
+            if not passes_filter(filt_key, _out_exts(ext), include, exclude, exts):
                 skipped_filter += 1
                 continue
 
@@ -440,6 +786,39 @@ def unpack(pck_path, output_dir, convert=True, organize=True, keep_webp=False,
                         extracted += 1
                     continue
 
+            # 音频/字体转换: .sample -> .wav, .fontdata -> .ttf/.otf
+            if convert_media and ext in MEDIA_EXT:
+                conv = convert_media_asset(data, ext)
+                if conv is not None:
+                    mbytes, mext = conv
+                    tgt = None
+                    bn = os.path.basename(ent["path"])
+                    if organize and bn in imp_map:
+                        # 归位到开发时原始路径 (如 Sounds/Bump.wav)
+                        orig = imp_map[bn]
+                        tgt = os.path.join(output_dir,
+                                           os.path.splitext(orig)[0] + "." + mext)
+                    if tgt is None:
+                        # 回退: 从 foo.wav-<hash>.sample 反推原名, 落到同目录
+                        tgt = os.path.join(os.path.dirname(out_path) or output_dir,
+                                           _media_basename(ent["path"], mext))
+                    os.makedirs(os.path.dirname(tgt) or output_dir, exist_ok=True)
+                    try:
+                        with open(tgt, "wb") as o:
+                            o.write(mbytes)
+                        extracted += 1
+                    except Exception as e:
+                        _log("[!] 写入失败 %s: %s" % (ent["path"], e), is_err=True)
+                        errors += 1
+                        continue
+                    if keep_raw:
+                        os.makedirs(os.path.dirname(out_path) or output_dir,
+                                    exist_ok=True)
+                        with open(out_path, "wb") as o:
+                            o.write(data)
+                        extracted += 1
+                    continue
+
             # 普通文件: 原样写出
             os.makedirs(os.path.dirname(out_path) or output_dir, exist_ok=True)
             try:
@@ -464,6 +843,8 @@ def main():
     ap.add_argument("-o", "--output", help="输出目录 (默认: <pck名>_unpacked)")
     ap.add_argument("--no-convert", action="store_true",
                     help="不把纹理 (.ctex/.stex) 转成 PNG/WebP")
+    ap.add_argument("--no-media", action="store_true",
+                    help="不把音频 (.sample) / 字体 (.fontdata) 还原成 .wav/.ttf")
     ap.add_argument("--no-organize", action="store_true",
                     help="不按 .import 映射把纹理归位到原始路径")
     ap.add_argument("--keep-webp", action="store_true",
@@ -474,7 +855,7 @@ def main():
                     help="不导出导入元数据 (.import/.remap, 纯文本约1KB, 改后缀也打不开)")
     ap.add_argument("--include", help="只导出这些路径前缀 (逗号/空格分隔, 如 Sprites,Sounds,UI)")
     ap.add_argument("--exclude", help="排除这些路径前缀 (逗号/空格分隔)")
-    ap.add_argument("--ext", help="只导出这些源扩展名 (逗号/空格分隔, 如 ctex,scn,gd)")
+    ap.add_argument("--ext", help="只导出这些扩展名 (源或转换后, 逗号/空格分隔, 如 png,ctex,wav,ttf)")
     ap.add_argument("--list", action="store_true",
                     help="仅列出包内文件, 不解包")
     ap.add_argument("-q", "--quiet", action="store_true", help="减少输出")
@@ -492,6 +873,7 @@ def main():
             out,
             convert=not args.no_convert,
             organize=not args.no_organize,
+            convert_media=not args.no_media,
             keep_webp=args.keep_webp,
             keep_raw=args.keep_raw,
             list_only=args.list,

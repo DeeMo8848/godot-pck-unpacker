@@ -7,7 +7,8 @@ Godot PCK 解包器 —— 图形界面版
 基于 godot_pck_unpacker.py 的解包内核, 提供:
   - 选择/拖拽 .pck 文件 (Windows 拖拽)
   - 选择输出文件夹
-  - 按类型导出: 全部 / 图像 / 音效 / 字体 / 脚本 / 场景 / 着色器
+  - 按类型导出: 全部 / 图像 / 音效 / 字体 / 脚本 / 场景 / 着色器 / 资源
+  - 音频/字体自动还原为可用格式 (.sample→.wav, .fontdata→.ttf)
   - 进度条 + 日志 + 取消
 
 零额外基础依赖: 仅用 Python 标准库 (tkinter)。纹理转 PNG 可选依赖 Pillow。
@@ -62,7 +63,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Godot PCK 解包器")
-        root.geometry("700x580")
+        root.geometry("720x620")
         try:
             root.iconbitmap()  # 无图标则忽略
         except Exception:
@@ -74,7 +75,9 @@ class App:
         self.cat_vars = {name: tk.BooleanVar(value=False) for name in CATEGORIES}
         self.organize_var = tk.BooleanVar(value=True)
         self.convert_var = tk.BooleanVar(value=True)
+        self.media_var = tk.BooleanVar(value=True)   # 音频/字体还原为 .wav/.ttf
         self.keepraw_var = tk.BooleanVar(value=False)
+        self.cat_btns = {}
         self.skip_meta_var = tk.BooleanVar(value=True)  # 默认跳过 .import/.remap 元数据
         self._dropped = []  # 拖拽: 由 WNDPROC 填充, 主线程 _poll 消费
         self.status_var = tk.StringVar(value="请选择或拖入 .pck 文件")
@@ -118,7 +121,11 @@ class App:
         cf = ttk.Frame(f3)
         cf.pack(fill="x", padx=8, pady=2)
         for name in CATEGORIES:
-            ttk.Checkbutton(cf, text=name, variable=self.cat_vars[name]).pack(side="left", padx=6)
+            b = ttk.Checkbutton(cf, text=name, variable=self.cat_vars[name])
+            b.pack(side="left", padx=6)
+            self.cat_btns[name] = b
+        # 选「全部」时分类复选框全选置灰, 选「自定义」时清空恢复可选
+        self.mode.trace_add("write", lambda *a: self._on_mode_change())
 
         # 选项
         f4 = ttk.LabelFrame(self.root, text="选项")
@@ -130,7 +137,10 @@ class App:
         ttk.Checkbutton(row1, text="额外保留原始纹理(工程重建)", variable=self.keepraw_var).pack(side="left", padx=8)
         row2 = ttk.Frame(f4)
         row2.pack(fill="x", padx=4, pady=2)
-        ttk.Checkbutton(row2, text="跳过 .import/.remap 元数据 (勾选后只保留真实资源, 输出更干净)", variable=self.skip_meta_var).pack(side="left", padx=8)
+        ttk.Checkbutton(row2, text="音频/字体还原为可用格式 (.sample→.wav, .fontdata→.ttf)", variable=self.media_var).pack(side="left", padx=8)
+        row3 = ttk.Frame(f4)
+        row3.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(row3, text="跳过 .import/.remap 元数据 (勾选后只保留真实资源, 输出更干净)", variable=self.skip_meta_var).pack(side="left", padx=8)
 
         # 分析信息
         ttk.Label(self.root, textvariable=self.info_var, foreground="darkgreen").pack(
@@ -158,6 +168,18 @@ class App:
         sb = ttk.Scrollbar(lf, command=self.log_text.yview)
         sb.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=sb.set)
+        self._on_mode_change()
+
+    def _on_mode_change(self):
+        """选「全部」-> 分类复选框全选并置灰; 选「自定义」-> 清空并恢复可选。"""
+        all_mode = (self.mode.get() == "all")
+        for name, btn in getattr(self, "cat_btns", {}).items():
+            if all_mode:
+                self.cat_vars[name].set(True)
+                btn.config(state="disabled")
+            else:
+                self.cat_vars[name].set(False)
+                btn.config(state="normal")
 
     # ---------------- 选择 ----------------
     def _choose_pck(self):
@@ -249,6 +271,7 @@ class App:
         kwargs = dict(
             pck_path=p, output_dir=out,
             convert=self.convert_var.get(), organize=self.organize_var.get(),
+            convert_media=self.media_var.get(),
             keep_webp=False, keep_raw=self.keepraw_var.get(),
             list_only=False, quiet=False, skip_meta=self.skip_meta_var.get(),
             include=None, exclude=None, exts=exts,

@@ -1,6 +1,6 @@
 # Godot PCK 解包工具 (godot_pck_unpacker.py)
 
-通用 Godot 资源包 (.pck) 解包器，自动识别版本，纹理自动转 PNG。
+通用 Godot 资源包 (.pck) 解包器：自动识别版本，纹理转 PNG，音频/字体还原为可用格式。
 
 ## 支持的版本
 | PCK 版本 | 对应 Godot | 状态 |
@@ -23,6 +23,9 @@ python godot_pck_unpacker.py game.pck --list
 # 不转换纹理 (保留原始 .ctex/.stex)
 python godot_pck_unpacker.py game.pck --no-convert
 
+# 不还原音频/字体 (保留原始 .sample/.fontdata)
+python godot_pck_unpacker.py game.pck --no-media
+
 # 不按原始路径归位 (纹理只放在 .godot/imported/ 下)
 python godot_pck_unpacker.py game.pck --no-organize
 
@@ -40,12 +43,12 @@ python godot_pck_unpacker.py game.pck --no-meta
 |------|------|------|
 | `--include` | 只导出这些**路径前缀** (文件夹/分类) | `--include Sprites,Sounds,UI` |
 | `--exclude` | 排除这些路径前缀 | `--exclude .godot` |
-| `--ext`     | 只导出这些**源扩展名** | `--ext ctex,scn,gd` |
+| `--ext`     | 只导出这些**扩展名** (源或转换后) | `--ext ctex,scn,png,wav,ttf` |
 
 - 多个值用逗号或空格分隔，如 `Sprites,Sounds` 或 `Sprites Sounds`
 - `--include`/`--exclude` 按路径片段匹配：含 `/` 当路径片段；以 `.` 开头（如 `.import`、`.godot`）同时按**扩展名(后缀)**和**目录**匹配；其余当目录前缀
-- `--ext` 按**包内原始扩展名**匹配（`.ctex` 才是纹理源，归位后变 `.png`）
-- 纹理筛选以**归位后的原始路径**为准，所以 `--include Sprites` 能正确捞出归位到 `Sprites/` 的 PNG
+- `--ext` 同时匹配**包内原始扩展名**和**转换后的扩展名**：`--ext ctex` 与 `--ext png` 都能选出纹理，`--ext sample` / `--ext wav` 都能选出音频，`--ext fontdata` / `--ext ttf` 都能选出字体
+- 纹理/音频/字体筛选以**归位后的原始路径**为准，所以 `--include Sprites` / `--include Sounds` / `--include Fonts` 能正确捞出归位后的 PNG/WAV/TTF
 - `--list` 也会应用同样的筛选，方便先预览再提取
 
 ```bash
@@ -58,6 +61,9 @@ python godot_pck_unpacker.py game.pck --list --include Sprites
 # 导出所有场景和脚本 (Godot 4 脚本是编译后的 .gdc)
 python godot_pck_unpacker.py game.pck --ext scn,gdc
 
+# 只导音频和字体 (自动还原成 .wav / .ttf)
+python godot_pck_unpacker.py game.pck --ext wav,ttf --include Sounds,Fonts
+
 # 除 .godot 缓存目录外全导出
 python godot_pck_unpacker.py game.pck --exclude .godot
 ```
@@ -69,17 +75,27 @@ python godot_pck_unpacker.py game.pck --exclude .godot
   - 无法映射时，用 `.ctex` 文件名反推原始名（`foo.png-<哈希>.ctex` → `foo.png`），落在 `.godot/imported/` 下
   - 没有 Pillow 时回退保存为 `.webp` (浏览器/系统照片查看器可直接打开)
 - **关于 `.import` / `.remap`**：这俩是 Godot 的**导入元数据**（约 1KB 纯文本），记录纹理等资源的导入方式，**不是图片本身**——把它们改后缀成 `.png` 也打不开。真实图片永远在 `.ctex` 里，本工具会转成 PNG。默认行为：**CLI 导出全部**（可用 `--no-meta` 跳过），**GUI 默认跳过**元数据（“跳过 .import/.remap 元数据”复选框默认勾选，取消勾选即导出全部）。跳过不会丢失任何真实资源。
+- **音频 / 字体自动还原**：PCK 里这两类也是**打包后格式**，改后缀不能播放/安装：
+  - `.sample` = Godot 二进制资源里的 `AudioStreamWAV`，PCM 数据内联在资源体内。本工具按资源结构读出 `data/format/mix_rate/stereo`，自行封装 RIFF/WAVE 头 → 可播放的 `.wav`（44100/48000 Hz，单/双声道 16-bit）
+  - `.fontdata` = `RSCC` 压缩资源（zstd），解压后得到 `RSRC`，再从中提取内嵌字体 → 可安装的 `.ttf`/`.otf`（保留字体族名）
+  - 同样按 `.import` 映射归位到开发时原名（如 `Sounds/Bump.wav`、`Fonts/…/Noto_Sans_JP.ttf`）；无映射时从 `foo.wav-<哈希>.sample` 反推
+  - 可用 `--no-media` 关闭还原，保留原始 `.sample`/`.fontdata`
 - 加密文件 (PCK_FILE_ENCRYPTED) 自动跳过并提示
 
 ## 依赖
 - 必须: Python 3 标准库
 - 可选: Pillow (`pip install pillow`) — 用于把 WebP 转成 PNG；没有则保存原始 WebP
+- 可选: zstandard (`pip install zstandard`) — 用于解压 `.fontdata` 还原字体；没有则跳过字体转换（保留原始 `.fontdata`，不报错）
 
 ## 实现要点 (便于自行修改)
 - `parse_header()`: 按版本读 header (v2/v3 含 FileOffsetBase/DirectoryOffset)
 - `parse_directory()`: 目录区在 `header_size` 之后 (v3 用 DirectoryOffset)；条目含 path/offset/size/md5/(flags)
 - 偏移计算: v2/v3 为 `FileOffsetBase + 相对偏移`；v1 为绝对偏移
 - `convert_texture()`: `.ctex`(GST2) 内搜 `RIFF...WEBP` 提取；`.stex` 同法尽力提取
+- `parse_rsrc()` / `decompress_rscc()`: 解析 Godot 4 二进制资源 (`RSRC`) 与压缩资源 (`RSCC`/zstd)——字符串表、Variant 类型、子资源属性
+- `convert_sample()`: 拆 `AudioStreamWAV` 取 `data/format/mix_rate/stereo` → `build_wav()` 封装 RIFF/WAVE
+- `convert_fontdata()`: 解 RSCC 后提取内嵌 TTF/OTF（按 `\x00\x01\x00\x00`/`OTTO` 签名定位）
+- `build_import_map()`: 扫 `.import`/`.remap`，建立 *导入产物文件名 → 开发时原始路径* 映射（纹理/音频/字体通用）
 
 > 注: 编译后的脚本 `.gdc` 属于代码 (Godot 4 已加密编译)，本工具不解包代码逻辑。
 
@@ -103,22 +119,22 @@ dist\GodotPCKUnpacker.exe
 - **源文件**：点击「浏览...」选择 `.pck`，或把 `.pck` 直接拖拽到窗口（Windows 支持拖拽）
 - **输出文件夹**：点击「选择...」指定；不选则默认 `<pck名>_unpacked`
 - **导出类型**：
-  - `全部` —— 导出包内所有资源
-  - `自定义分类` —— 勾选 图像 / 音效 / 字体 / 脚本 / 场景 / 着色器 / 资源 中的一个或多个
+  - `全部` —— 导出包内所有资源（此时下面的分类复选框会**自动全选并置灰**，避免误操作）
+  - `自定义分类` —— 勾选 图像 / 音效 / 字体 / 脚本 / 场景 / 着色器 / 资源 中的一个或多个（从“全部”切过来时会**自动清空并恢复可选**）
     - 图像 = `.ctex/.stex`（自动转 PNG 并归位到原始路径）+ 原始位图
-    - 音效 = 打包后的 `.sample`(Godot4 WAV) / `.oggvorbisstr`(Godot4 OGG)，兼容 `.wav/.ogg/.mp3/.opus/.flac`
-    - 字体 = 打包后的 `.fontdata`，兼容 `.ttf/.otf/.woff`
+    - 音效 = 打包后的 `.sample`(Godot4 WAV) / `.oggvorbisstr`(Godot4 OGG)，兼容 `.wav/.ogg/.mp3/.opus/.flac`；勾选还原时输出可播放的 `.wav`
+    - 字体 = 打包后的 `.fontdata`，兼容 `.ttf/.otf/.woff`；勾选还原时输出可安装的 `.ttf/.otf`
     - 脚本 = `.gd/.gdc/.cs`；场景 = `.tscn/.scn`；着色器 = `.gdshader/.shader`；资源 = `.res/.tres`
     - ⚠ PCK 里音频/字体是**打包后**格式（`.sample` / `.fontdata`），不是源文件 `.wav` / `.ttf`
-- **选项**：纹理归位到原始路径（默认开）、纹理转为 PNG（默认开）、额外保留原始纹理（用于 Godot 工程重建）、跳过 .import/.remap 元数据（**默认勾选**；取消勾选则连元数据一起导出）
+- **选项**：纹理归位到原始路径（默认开）、纹理转为 PNG（默认开）、额外保留原始纹理（用于 Godot 工程重建）、音频/字体还原为可用格式（**默认开**，`.sample→.wav`、`.fontdata→.ttf`）、跳过 .import/.remap 元数据（**默认勾选**；取消勾选则连元数据一起导出）
 - **进度条 + 日志 + 取消**：解包在后台线程进行，不卡界面；可随时点「取消」中止
 - 选好文件后会自动**分析**并显示 `Godot 版本 | 共 N 文件 | 各分类数量`，方便决定导出哪些
 
 ### 打包 exe（如需自行重新构建）
 ```bash
-pip install pyinstaller pillow
+pip install pyinstaller pillow zstandard
 python -m PyInstaller --onefile --windowed --name GodotPCKUnpacker \
-    --hidden-import PIL --hidden-import PIL.Image godot_pck_gui.py
+    --hidden-import PIL --hidden-import PIL.Image --hidden-import zstandard godot_pck_gui.py
 # 产物在 dist/GodotPCKUnpacker.exe
 ```
 

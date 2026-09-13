@@ -1,7 +1,7 @@
 # Godot PCK 解包工具
 
 通用 Godot 游戏资源包（`.pck`）解包工具，支持**命令行**与**图形界面（EXE）**两种用法，
-自动识别 PCK 版本，纹理（`.ctex` / `.stex`）自动提取内嵌图像并转为 PNG。
+自动识别 PCK 版本，纹理（`.ctex` / `.stex`）自动提取内嵌图像并转为 PNG，音频（`.sample`）与字体（`.fontdata`）自动还原为可用的 `.wav` / `.ttf`。
 
 > ⚠️ **版本支持声明（重要）**
 > 本工具当前**仅对 Godot 4 做过真实解包验证**（在 Godot 4.4.1 的 269MB 资源包上成功提取全部 4566 个文件）。
@@ -21,10 +21,13 @@
 - 自动识别 PCK 版本（读 FormatVersion），无需手动指定
 - 解包全部文件，保留 `res://` 目录结构
 - 纹理自动转 PNG（Godot 4 的 `.ctex` 内为 WebP，提取后转 PNG；无 Pillow 时回退存 `.webp`）
-- 利用 `.import` 映射把纹理**归位到开发时的原始路径**（干净文件名，如 `Sprites/Logo_Layers/5.png`）
+- 音频自动还原为可播放的 `.wav`（解析 `AudioStreamWAV` 资源，自行封装 RIFF/WAVE）
+- 字体自动还原为可安装的 `.ttf`/`.otf`（解压 `RSCC`/zstd 后提取内嵌字体）
+- 利用 `.import` 映射把资源**归位到开发时的原始路径**（干净文件名，如 `Sprites/Logo_Layers/5.png`、`Sounds/Bump.wav`）
 - 加密文件自动跳过并提示
 - 可选按类型/扩展名筛选导出（命令行与界面均支持）
 - 图形界面：拖拽添加、选择输出文件夹、按分类导出、进度条、可取消
+- 界面选「全部」时分类复选框自动全选置灰，选「自定义分类」时自动清空
 
 ## 文件说明
 
@@ -52,28 +55,35 @@ python godot_pck_unpacker.py game.pck --include Sprites,Sounds,UI
 
 # 转 PNG 时额外保留原始 .ctex（用于 Godot 工程重建）
 python godot_pck_unpacker.py game.pck --keep-raw
+
+# 只导音频和字体（自动还原成 .wav / .ttf）
+python godot_pck_unpacker.py game.pck --ext wav,ttf --include Sounds,Fonts
 ```
 
-筛选参数：`--include 前缀`、`--exclude 前缀`、`--ext 扩展名`（逗号或空格分隔）。
+筛选参数：`--include 前缀`、`--exclude 前缀`、`--ext 扩展名`（逗号或空格分隔，支持源扩展名或转换后扩展名）。
+其他开关：`--no-convert`（不转纹理）、`--no-media`（不还原音频/字体）、`--no-meta`（不导 `.import`/`.remap` 元数据）。
 
 ## 图形界面 / EXE 用法
 
 - 方式一（需本机有 Python）：`python godot_pck_gui.py`
 - 方式二（无需 Python）：直接双击 Releases 里的 `GodotPCKUnpacker.exe`；也可把 `.pck` 拖到 exe 图标上自动加载
 
-界面功能：浏览/拖拽选择 `.pck` → 选择输出文件夹 → 选「全部」或勾选分类（图像/音效/字体/脚本/场景/着色器）→ 开始解包（带进度条、日志、取消）。
+界面功能：浏览/拖拽选择 `.pck` → 选择输出文件夹 → 选「全部」或勾选分类（图像/音效/字体/脚本/场景/着色器/资源）→ 开始解包（带进度条、日志、取消）。
+
+> PCK 里音频/字体是**打包后格式**（`.sample`/`.fontdata`），不是 `.wav`/`.ttf`。勾选「音频/字体还原为可用格式」（默认开）后会输出可直接播放/安装的 `.wav`/`.ttf`。
 
 ## 依赖
 
 - 必须：Python 3 标准库
 - 可选：Pillow（`pip install pillow`）—— 用于把 WebP 转成 PNG；没有则保存原始 WebP
+- 可选：zstandard（`pip install zstandard`）—— 用于解压 `.fontdata` 还原字体；没有则跳过字体转换（不报错）
 
 ## 重新打包 EXE
 
 ```bash
-pip install pyinstaller pillow
+pip install pyinstaller pillow zstandard
 python -m PyInstaller --onefile --windowed --name GodotPCKUnpacker ^
-    --hidden-import PIL --hidden-import PIL.Image godot_pck_gui.py
+    --hidden-import PIL --hidden-import PIL.Image --hidden-import zstandard godot_pck_gui.py
 # 产物在 dist/GodotPCKUnpacker.exe
 ```
 
